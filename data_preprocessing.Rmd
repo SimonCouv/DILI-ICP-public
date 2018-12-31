@@ -1,0 +1,482 @@
+
+
+
+# setup 
+```{r libraries}
+
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+library(stringi)
+library(biomaRt)
+library(dplyr)
+#library(profvis)
+#library(microbenchmark)
+library(ggplot2)
+library(reshape2)
+library(xlsx)
+library(reader)
+library(R.utils)
+library(tidyr)
+library(readr)
+library(stringr)
+library(gplots)
+library(svMisc)
+library(RCurl)
+library(data.table)
+library(tictoc)
+library(rentrez)
+library(GenomicRanges)
+library(rtracklayer)
+library(Gviz)
+```
+
+
+```{r directories}
+inputdir <- file.path(dirname(getwd()), "input_data")
+figdir <- file.path(dirname(getwd()), "figs")
+RDSdir <- file.path(getwd(),"RDS")
+rosalind_outdir <- file.path(dirname(getwd()),"rosalind_output")
+DILI.sum.dir <- file.path(inputdir,"Nicoletti_DILI_GWAS_summary_data")
+preprocessed_datadir <- file.path(dirname(getwd()), "preprocessed_data")
+
+```
+
+
+
+```{r functions}
+source("save_versioned_data.R")
+source("save_versioned_tsv.R")
+source("read_most_recent.R")
+source("get_versioned_png_dir.R")  #keeping for compatibility
+source("get_versioned_fig_dir.R")
+source("inrich_log_parser.R")
+source("in_1KG.R")
+source("HGNC_annotate.R")
+source("annotate_search_range.R")
+source("mybinnedaverage.R")
+source("create_query_bins.R")
+source("create_signal_df_list.R")
+source("classify_chromHMM25_prom.R")
+source("classify_chromHMM25_enh.R")
+source("classify_chromHMM15_prom.R")
+source("classify_chromHMM15_enh.R")
+source("create_chromHMM_grl.R")
+```
+
+
+
+```{r biomaRt}
+
+# SNP
+ensSNP.GRCh38.p12.mart <- useMart("ENSEMBL_MART_SNP", verbose = TRUE)                                              #ensembl v94
+ensSNP.GRCh37.p13.mart <- useMart(biomart = "ENSEMBL_MART_SNP", verbose = TRUE, host = "http://grch37.ensembl.org")                       
+ensSNP.GRCh38.p12<- useDataset("hsapiens_snp", mart = ensSNP.GRCh38.p12.mart, verbose = TRUE)
+ensSNP.GRCh37.p13<- useDataset("hsapiens_snp", mart = ensSNP.GRCh37.p13.mart, verbose = TRUE)
+
+#genes
+ensgenes.GRCh38.p12 <- useMart("ENSEMBL_MART_ENSEMBL" , verbose = TRUE, dataset = "hsapiens_gene_ensembl")
+ensgenes.GRCh37.p13 <- useMart("ENSEMBL_MART_ENSEMBL" , verbose = TRUE, dataset = "hsapiens_gene_ensembl", host = "feb2014.archive.ensembl.org")
+
+```
+
+
+
+
+# load input data 
+
+## DILI data 
+```{r top-SNPs}
+topAC <- read.table(file.path(DILI.sum.dir,"AC.top.10000.or.txt"), header = FALSE, stringsAsFactors = FALSE) #amoxicillin-clavulanic acid-induced cases
+topALL <- read.table(file.path(DILI.sum.dir,"ALL.top.10000.or.txt"), header = FALSE, stringsAsFactors = FALSE) #all patients
+topHC <- read.table(file.path(DILI.sum.dir,"Hep.top.10000.or.txt"), header = FALSE, stringsAsFactors = FALSE) #hepatocellular cases
+topMC <- read.table(file.path(DILI.sum.dir,"MC.top.10000.or.txt"), header = FALSE, stringsAsFactors = FALSE) #mixed and cholestatic cases
+topCH <- read.table(file.path(DILI.sum.dir,"CHOL.10000.top.txt"), header = FALSE, stringsAsFactors = FALSE) #mixed and cholestatic cases
+```
+
+
+```{r Nicoletti-paper}
+#Nicoletti et al. 2017
+Nicoletti.paper <- data.frame(
+  RefSNP = c("rs114577328", "rs72631567", "rs28521457", "rs116561224"),
+  overall = c(TRUE, TRUE, FALSE, FALSE),
+  MC = c(TRUE, TRUE, FALSE, FALSE),
+  HC = c(FALSE, TRUE,TRUE,FALSE),
+  drugclass = c(rep("overall",3), "statin")
+)
+```
+
+
+## ICP data 
+```{r}
+Dixon2014 <- read.csv2(file.path(inputdir, "Dixon2014_AMJG_table1.txt"), header = TRUE)
+Dixon.newhits <- readxl::read_xlsx(file.path(inputdir, "Dixon_ICP_dbSNP.xlsx"))
+Dixon.ICP.genelist <- readxl::read_xlsx(file.path(inputdir, "Dixon_ICP_candidategenes.xlsx"))
+
+ICP_GWAS_DT <- fread(file.path(inputdir,"ICP_notEURonly_log_BRIDGE_PC5.assoc.logistic_send.bz2"))
+```
+
+
+# Pre-process input data
+
+## top-ranking DILI SNPs 
+
+```{r}
+names(topAC) <- names(topALL) <- names(topHC) <- names(topMC) <- names(topCH) <- c("chr", "SNP", "bp", "OR", "95.lower", "95.upper", "p-value")
+topAC$rank <- topALL$rank <- topMC$rank <- topHC$rank <- topCH$rank <- 1:10000
+
+Nicoletti.loci.ext <- unique(c(topALL$SNP, topAC$SNP, topHC$SNP, topMC$SNP, topCH$SNP))
+Nicoletti.loci.ext.df <- unique(bind_rows(topALL[,1:3], topAC[,1:3], topHC[,1:3], topMC[,1:3], topCH[,1:3])) %>% mutate(chr_long = paste0("chr", chr))
+Nicoletti.loci.ext.DT <- as.data.table(Nicoletti.loci.ext.df)
+setkey(Nicoletti.loci.ext.DT, chr, bp)
+```
+
+## ICP top SNPs
+
+```{r}
+
+#combine RefSNPs from Dixon2014 and newhits WGS
+Dixon.RefSNP.data <- bind_rows(Dixon2014 = Dixon2014, Dixon.newhits=Dixon.newhits, .id = "source") %>% arrange(gene, RefSNP)
+
+#see which RefSNPs are in 1KG 
+#TODO find query to more specifically filter only for 1KG <<<PHASE 3>>>
+Dixon.RefSNP.data$in1KG <- in1KG(Dixon.RefSNP.data$RefSNP)
+
+anno <- getBM(ensSNP.GRCh37.p13,
+              filters = "snp_filter",
+              values=Dixon.RefSNP.data$RefSNP,
+              attributes = c("refsnp_id","chr_name", "chrom_start","chrom_end", "minor_allele_freq")) %>% mutate(RefSNP=refsnp_id)
+
+Dixon.RefSNP.data.GRCh37 <- Dixon.RefSNP.data %>% left_join(anno)
+
+```
+
+## ICP genes
+
+### ICP gene df
+
+```{r}
+HGNC.table <- readxl::read_xlsx(file.path(inputdir, "HGNC_non_alt_loci_set_20181008.xlsx"),col_types = "text")
+
+#join genes listed in the RefSNP table into the candidate gene table
+Dixon.ICP.genelist <- full_join(Dixon.ICP.genelist, Dixon.RefSNP.data %>% dplyr::select(gene) %>% distinct())
+Dixon.ICP.genelist <- HGNC_annotate(genelist = Dixon.ICP.genelist)
+
+#get gene annotations for Dixon.ICP.genelist, using biomart
+Dixon.ICP.genelist.GRCh37 <- merge(
+  Dixon.ICP.genelist,
+  getBM(mart = ensgenes.GRCh37.p13,
+        filters = c("chromosome_name","hgnc_id"),  #old coding: only id number without "HGNC:" prefix
+        values = list(c(1:22,"X","Y","MT"), sapply(Dixon.ICP.genelist$HGNC, FUN= function(x) strsplit(x,":")[[1]][2])),
+        attributes = c("ensembl_gene_id","hgnc_id", "hgnc_symbol","entrezgene", "chromosome_name", "start_position", "end_position", "strand", "gene_biotype")) %>%
+    mutate(hgnc_id = paste0("HGNC:",hgnc_id)),
+  by.x = c("gene","HGNC"),
+  by.y = c("hgnc_symbol","hgnc_id"))
+
+#add promotor regions
+for (i in 1:nrow(Dixon.ICP.genelist.GRCh37)){
+  range <- annotate_search_range(Dixon.ICP.genelist.GRCh37$start_position[i], Dixon.ICP.genelist.GRCh37$end_position[i], Dixon.ICP.genelist.GRCh37$strand[i], prom.len = 2000)
+  Dixon.ICP.genelist.GRCh37$range_start[i] <- range[[1]]
+  Dixon.ICP.genelist.GRCh37$range_end[i] <- range[[2]]
+}
+Dixon.ICP.genelist.GRCh37$range_length <- Dixon.ICP.genelist.GRCh37$range_end - Dixon.ICP.genelist.GRCh37$range_start + 1
+```
+
+### ICP gene ranges
+
+```{r}
+#convert to Granges to work with rtracklayer
+Dixon.ICP.gr <-Dixon.ICP.genelist.GRCh37 %>% 
+  mutate(strand2 = ifelse(Dixon.ICP.genelist.GRCh37$strand > 0,"+","-"),
+                                                      chr=paste0("chr",.$chromosome_name))%>%
+  dplyr::select(chr,range_start,range_end,strand2,gene_incl_2kb_prom=gene) %>% 
+  makeGRangesFromDataFrame(., 
+                         seqnames.field = "chr",
+                         start.field = "range_start",
+                         end.field = "range_end",
+                         keep.extra.columns = TRUE,
+                         strand.field = "strand2",
+                         seqinfo = Seqinfo(seqnames=NULL, genome = "hg19"))
+```
+
+
+### ICP GWAS
+
+```{r}
+
+ICP_GWAS_DT[, c("chr","bp","SNP_A","SNP_B") := tstrsplit(SNP, "_", fixed=TRUE)]
+```
+
+
+# Export for external processing
+
+## Rosalind
+```{r}
+
+```
+
+## bcftools
+```{r}
+write_tsv(Dixon.ICP.genelist.GRCh37 %>% select(CHROM=chromosome_name, POS=range_start, POS_TO=range_end), path = "Dixon_ICP_genelist_bcftools_regions.tsv")
+```
+
+## PLINK clumping of DILI SNPs
+
+```{r}
+#export .assoc file for plink clumping
+topAC.mapped %>% dplyr::select(P=`p-value`, SNP = RefSNP) %>% write_tsv("topAC_mapped.assoc")
+topALL.mapped %>% dplyr::select(P=`p-value`, SNP = RefSNP) %>% write_tsv("topALL_mapped.assoc")
+topHC.mapped %>% dplyr::select(P=`p-value`, SNP = RefSNP) %>% write_tsv("topHC_mapped.assoc")
+topMC.mapped %>% dplyr::select(P=`p-value`, SNP = RefSNP) %>% write_tsv("topMC_mapped.assoc")
+topCH.mapped %>% dplyr::select(P=`p-value`, SNP = RefSNP) %>% write_tsv("topCH_mapped.assoc")
+
+
+```
+
+
+# process input data 
+
+## Map top-ranking DILI SNPs to dbSNP 
+
+Rosalind script: BED_mapping_rosalind.R
+
+```{r}
+# #### Join with nicoletti tables ####
+read_most_recent("nicoletti_BED_mapped_full", readdir=rosalind_outdir)
+
+
+nicoletti_BED_mapped_37b151.1 <- dplyr::filter(nicoletti_BED_mapped_full, codingoffset==1, ref=="GRCh37p13b151")
+
+topAC.mapped <- topAC %>% mutate(chr = paste0("chr", chr)) %>% left_join(nicoletti_BED_mapped_37b151.1, by = c("chr", "bp"))
+topALL.mapped <- topALL %>% mutate(chr = paste0("chr", chr)) %>% left_join(nicoletti_BED_mapped_37b151.1, by = c("chr", "bp"))
+topMC.mapped <- topMC %>% mutate(chr = paste0("chr", chr)) %>% left_join(nicoletti_BED_mapped_37b151.1, by = c("chr", "bp"))
+topHC.mapped <- topHC %>% mutate(chr = paste0("chr", chr)) %>% left_join(nicoletti_BED_mapped_37b151.1, by = c("chr", "bp"))
+topCH.mapped <- topCH %>% mutate(chr = paste0("chr", chr)) %>% left_join(nicoletti_BED_mapped_37b151.1, by = c("chr", "bp"))
+
+```
+
+## Map ICP GWAS SNPs to dbSNP
+
+Rosalind scripts: 
+-BED_mapping_rosalind_ICP_seq.R
+-transform_ICP_GWAS_DT_reduced.R
+
+
+```{r}
+ICP_GWAS_mapped_DT_direct <- readRDS(file.path(rosalind_outdir,"ICP_GWAS_mapped_GRCh37_b151_DT2_v20181215_191955.RDS")) %>% .[codingoffset=="1"]
+
+ICP_GWAS_merged_DT <-ICP_GWAS_DT[,.(chr, bp = as.numeric(bp), OR, STAT, P)] %>%
+  inner_join(ICP_GWAS_mapped_DT_direct %>% dplyr::select(chr, bp, RefSNP = x.RefSNP), by=c("chr","bp")) %>%
+  drop_na() %>%
+  as.data.table(.)
+```
+
+## PLINK clumping of DILI SNPs
+
+Rosalind script: plink_DILI_SNP_clumping.sh
+
+# Read and process ICP gene annotation data
+
+## All RefSNPs
+
+```{r}
+# get RefSNP for all ICP genes
+ICP.gene.RefSNPs <- list()
+for (i in 1:nrow(Dixon.ICP.genelist.GRCh37)){
+  gene <- Dixon.ICP.genelist.GRCh37$gene[i]
+  chromosome_name <- Dixon.ICP.genelist.GRCh37$chromosome_name[i]
+  range_start <- Dixon.ICP.genelist.GRCh37$range_start[i]
+  range_end <- Dixon.ICP.genelist.GRCh37$range_end[i]
+
+  print(gene)
+  ICP.gene.RefSNPs[[gene]] <- getBM(ensSNP.GRCh37.p13,
+                    filters = c("chr_name", "start", "end"),
+                    values = list(chr_name = chromosome_name,
+                                  chrom_start = range_start,
+                                  chrom_end = range_end),
+                    attributes = c("refsnp_id","chrom_start", "refsnp_source"))
+}
+RefSNP.gene.matches <- bind_rows(ICP.gene.RefSNPs, .id="gene")
+```
+
+
+### Epigenomics
+
+RUN on rosalind: RoadmapEpi_BigWig_extract_ICPranges.R
+
+```{r}
+## import data
+RE_data_obs <- readRDS(file.path(inputdir,"Roadmap_epigenomics/RoadmapEpigenomics_LiverSamples_ICPranges_AllMarks_obs.RDS"))
+RE_data_imp <- readRDS(file.path(inputdir,"Roadmap_epigenomics/RoadmapEpigenomics_LiverSamples_ICPranges_AllMarks_imp.RDS"))
+
+#restructure data
+RE_data <- list()
+for (mark in names(RE_data_obs$E066$obs)){
+  nm <- paste0(mark, "_E066_obs")
+  RE_data[[nm]] <- RE_data_obs$E066$obs[[mark]]
+}
+for (mark in names(RE_data_obs$E118$obs)){
+  nm <- paste0(mark, "_E118_obs")
+  RE_data[[nm]] <- RE_data_obs$E118$obs[[mark]]
+}
+for (mark in names(RE_data_imp$E118$imp)){
+  nm <- paste0(mark, "_E118_imp")
+  RE_data[[nm]] <- RE_data_imp$E118$imp[[mark]]
+}
+for (mark in names(RE_data_imp$E066$imp)){
+  nm <- paste0(mark, "_E066_imp")
+  RE_data[[nm]] <- RE_data_imp$E066$imp[[mark]]
+}
+RE_data = RE_data[order(names(RE_data))]
+
+bin.list_500 <- create_query_bins(Dixon.ICP.gr, metacol = "gene_incl_2kb_prom", flt = Dixon.ICP.genelist$gene, tilew = 500)
+sdf_list_500 <- create_signal_df_list(bin.list = bin.list_500, track.list = RE_data)
+bin.list_100 <- create_query_bins(Dixon.ICP.gr, metacol = "gene_incl_2kb_prom", flt = Dixon.ICP.genelist$gene, tilew = 100)
+sdf_list_100 <- create_signal_df_list(bin.list = bin.list_100, track.list = RE_data)
+bin.list_50 <- create_query_bins(Dixon.ICP.gr, metacol = "gene_incl_2kb_prom", flt = Dixon.ICP.genelist$gene, tilew = 50)
+sdf_list_50 <- create_signal_df_list(bin.list = bin.list_50, track.list = RE_data)
+
+
+
+```
+
+
+### chromHMM
+
+```{r}
+
+### IMPUTED
+# from https://personal.broadinstitute.org/meuleman/reg2map/HoneyBadger2-impute_release/
+# Regions delineated using observed DNaseI data across 53 epigenomes,
+# annotated with the 12-mark 25-state model based on imputed data
+# across 127 epigenomes (Roadmap + ENCODE).
+
+## load data
+
+# imputed prom
+load("../input_data/Roadmap_epigenomics/Reg2Map/chromHMM_state_calls_lp2_prom_imp.RData")
+rm(max_probs)
+chromHMM_25_prom_imp <- max_states %>%
+  as.data.frame(.) %>%
+  dplyr::select(E066,E118) %>%
+  dplyr::mutate(pos=row.names(.)) %>%
+  dplyr::filter(E066>0|E118>0) %>%
+  tidyr::separate(pos,into=c("chr","start_end"),sep=":",remove=TRUE)%>%
+  tidyr::separate(start_end,into=c("start","end"),sep="-",remove=TRUE)
+rm(max_states)
+
+# imputed enhancer
+load("../input_data/Roadmap_epigenomics/Reg2Map/chromHMM_state_calls_lp2_enh_imp.RData")
+rm(max_probs)
+chromHMM_25_enh_imp <- max_states %>%
+  as.data.frame(.) %>%
+  dplyr::select(E066,E118) %>%
+  dplyr::mutate(pos=row.names(.)) %>%
+  dplyr::filter(E066>0|E118>0) %>%
+  tidyr::separate(pos,into=c("chr","start_end"),sep=":",remove=TRUE)%>%
+  tidyr::separate(start_end,into=c("start","end"),sep="-",remove=TRUE)
+rm(max_states)
+
+## classify
+chromHMM_25_prom_imp$E066_c <- classify_chromHMM25_prom(chromHMM_25_prom_imp$E066)
+chromHMM_25_prom_imp$E118_c <- classify_chromHMM25_prom(chromHMM_25_prom_imp$E118)
+chromHMM_25_enh_imp$E066_c <- classify_chromHMM25_enh(chromHMM_25_enh_imp$E066)
+chromHMM_25_enh_imp$E118_c <- classify_chromHMM25_enh(chromHMM_25_enh_imp$E118)
+
+## make grl
+chromHMM_25_prom_imp.gr <- makeGRangesFromDataFrame(chromHMM_25_prom_imp, ignore.strand = TRUE, keep.extra.columns = TRUE)
+chromHMM_25_enh_imp.gr <- makeGRangesFromDataFrame(chromHMM_25_enh_imp, ignore.strand = TRUE, keep.extra.columns = TRUE)
+chromHMM25_imp.grl <- create_chromHMM_grl(Dixon.ICP.gr, chromHMM_25_prom_imp.gr, chromHMM_25_enh_imp.gr)
+
+
+### OBSERVED
+
+# from https://personal.broadinstitute.org/meuleman/reg2map/HoneyBadger2_release/
+#Regions delineated using observed DNaseI data across 53 epigenomes,
+# annotated with the 5-mark 15-state model based on observed data
+# across 127 epigenomes (Roadmap + ENCODE)
+
+## load data
+
+# observed prom
+load("../input_data/Roadmap_epigenomics/Reg2Map/chromHMM_state_calls_lp2_prom_obs.RData")
+rm(max_probs)
+chromHMM_15_prom_obs <- max_states %>%
+  as.data.frame(.) %>%
+  dplyr::select(E066,E118) %>%
+  dplyr::mutate(pos=row.names(.)) %>%
+  dplyr::filter(E066>0|E118>0) %>%
+  tidyr::separate(pos,into=c("chr","start_end"),sep=":",remove=TRUE)%>%
+  tidyr::separate(start_end,into=c("start","end"),sep="-",remove=TRUE)
+rm(max_states)
+
+# observed enhancer
+load("../input_data/Roadmap_epigenomics/Reg2Map/chromHMM_state_calls_lp2_enh_obs.RData")
+rm(max_probs)
+chromHMM_15_enh_obs <- max_states %>%
+  as.data.frame(.) %>%
+  dplyr::select(E066,E118) %>%
+  dplyr::mutate(pos=row.names(.)) %>%
+  dplyr::filter(E066>0|E118>0) %>%
+  tidyr::separate(pos,into=c("chr","start_end"),sep=":",remove=TRUE)%>%
+  tidyr::separate(start_end,into=c("start","end"),sep="-",remove=TRUE)
+rm(max_states)
+
+## classify
+chromHMM_15_prom_obs$E066_c <- classify_chromHMM15_prom(chromHMM_15_prom_obs$E066)
+chromHMM_15_prom_obs$E118_c <- classify_chromHMM15_prom(chromHMM_15_prom_obs$E118)
+chromHMM_15_enh_obs$E066_c <- classify_chromHMM15_enh(chromHMM_15_enh_obs$E066)
+chromHMM_15_enh_obs$E118_c <- classify_chromHMM15_enh(chromHMM_15_enh_obs$E118)
+
+## make grl
+chromHMM_15_prom_obs.gr <- makeGRangesFromDataFrame(chromHMM_15_prom_obs, ignore.strand = TRUE, keep.extra.columns = TRUE)
+chromHMM_15_enh_obs.gr <- makeGRangesFromDataFrame(chromHMM_15_enh_obs, ignore.strand = TRUE, keep.extra.columns = TRUE)
+chromHMM15_obs.grl <- create_chromHMM_grl(Dixon.ICP.gr, chromHMM_15_prom_obs.gr, chromHMM_15_enh_obs.gr)
+
+```
+
+
+
+# Save for data analysis
+
+```{r}
+#processed inputs
+save_versioned_data(Dixon.RefSNP.data.GRCh37, preprocessed_datadir)
+write_tsv(Dixon.ICP.genelist.GRCh37, path = file.path(preprocessed_datadir,"Dixon.ICP.genelist.GRCh37.tsv"))
+save_versioned_data(Dixon.ICP.gr, preprocessed_datadir)
+
+save_versioned_data(nicoletti_BED_mapped_37b151.1, folder = preprocessed_datadir)
+save_versioned_data(nicoletti_BED_mapped_full, folder = preprocessed_datadir)
+
+save_versioned_data(topAC.mapped, folder = preprocessed_datadir)
+save_versioned_data(topALL.mapped, folder = preprocessed_datadir)
+save_versioned_data(topMC.mapped, folder = preprocessed_datadir)
+save_versioned_data(topHC.mapped, folder = preprocessed_datadir)
+save_versioned_data(topCH.mapped, folder = preprocessed_datadir)
+
+save_versioned_data(ICP_GWAS_merged_DT, preprocessed_datadir)
+
+#processed annotation data
+#RefSNPs
+save_versioned_data(RefSNP.gene.matches, preprocessed_datadir)
+
+#epigenomics
+save_versioned_data(sdf_list_500,folder=preprocessed_datadir)
+save_versioned_data(sdf_list_100,folder=preprocessed_datadir)
+save_versioned_data(sdf_list_50,folder=preprocessed_datadir)
+
+#chromHMM
+# save_versioned_data(chromHMM_25_prom_imp.gr, RDSdir)
+# save_versioned_data(chromHMM_25_enh_imp.gr, RDSdir)
+# save_versioned_data(chromHMM_15_prom_obs.gr, RDSdir)
+# save_versioned_data(chromHMM_15_enh_obs.gr, RDSdir)
+
+save_versioned_data(chromHMM15_obs.grl, folder=preprocessed_datadir)
+save_versioned_data(chromHMM25_imp.grl, folder=preprocessed_datadir)
+
+```
+
+
+
+
+

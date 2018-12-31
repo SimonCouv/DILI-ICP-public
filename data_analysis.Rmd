@@ -1,0 +1,839 @@
+
+# Setup
+
+```{r libraries}
+
+library(knitr)
+library(kableExtra)
+library(gridExtra)
+library(stringi)
+library(biomaRt)
+library(dplyr)
+#library(profvis)
+#library(microbenchmark)
+library(ggplot2)
+library(reshape2)
+library(xlsx)
+library(reader)
+library(R.utils)
+library(tidyr)
+library(readr)
+library(stringr)
+library(gplots)
+library(svMisc)
+library(RCurl)
+library(data.table)
+library(tictoc)
+library(rentrez)
+library(GenomicRanges)
+library(rtracklayer)
+library(LDheatmap)
+library(ggbio)
+library(gplots)
+```
+
+
+
+```{r directories}
+inputdir <- file.path(dirname(getwd()), "input_data")
+datadir<- file.path(dirname(getwd()), "data")
+figdir <- file.path(dirname(getwd()), "figs")
+RDSdir <- file.path(getwd(),"RDS_temp")
+rosalind_outdir <- file.path(dirname(getwd()), "rosalind_output")
+DILI.sum.dir <- file.path(inputdir,"Nicoletti_DILI_GWAS_summary_data")
+preprocessed_datadir <- file.path(dirname(getwd()), "preprocessed_data")
+```
+
+```{r source-functions}
+source("save_versioned_data.R")
+source("save_versioned_tsv.R")
+source("read_most_recent.R")
+source("get_versioned_png_dir.R")  #keeping for compatibility
+source("get_versioned_fig_dir.R")
+source("inrich_log_parser.R")
+
+source("get_BM_anno.R")
+source("lookup_rs.R")
+
+source("get_LD_heatmap.R")
+
+source("get_SNPs_in_gene_overview.R")
+
+source("gviz_rescale.R")
+```
+
+```{r biomaRt}
+
+# SNP
+ensSNP.GRCh38.p12.mart <- useMart("ENSEMBL_MART_SNP", verbose = TRUE)                                              #ensembl v94
+ensSNP.GRCh37.p13.mart <- useMart(biomart = "ENSEMBL_MART_SNP", verbose = TRUE, host = "http://grch37.ensembl.org")                       
+ensSNP.GRCh38.p12<- useDataset("hsapiens_snp", mart = ensSNP.GRCh38.p12.mart, verbose = TRUE)
+ensSNP.GRCh37.p13<- useDataset("hsapiens_snp", mart = ensSNP.GRCh37.p13.mart, verbose = TRUE)
+
+#genes
+ensgenes.GRCh38.p12 <- useMart("ENSEMBL_MART_ENSEMBL" , verbose = TRUE, dataset = "hsapiens_gene_ensembl")
+ensgenes.GRCh37.p13 <- useMart("ENSEMBL_MART_ENSEMBL" , verbose = TRUE, dataset = "hsapiens_gene_ensembl", host = "feb2014.archive.ensembl.org")
+
+```
+
+# Load processed data
+
+```{r}
+read_most_recent("ICP_GWAS_merged_DT", preprocessed_datadir)
+read_most_recent("Dixon.RefSNP.data.GRCh37", preprocessed_datadir)
+Dixon.ICP.genelist.GRCh37 <- read_tsv(file.path(preprocessed_datadir,"Dixon.ICP.genelist.GRCh37.tsv"))
+read_most_recent("Dixon.ICP.gr", preprocessed_datadir)
+
+
+read_most_recent("nicoletti_BED_mapped_full", readdir=preprocessed_datadir)
+read_most_recent("nicoletti_BED_mapped_37b151.1", readdir=preprocessed_datadir)
+read_most_recent(readdir = preprocessed_datadir, pattern = "top.{2,3}\\.mapped")
+
+read_most_recent("RefSNP.gene.matches", preprocessed_datadir)
+read_most_recent("sdf_list",readdir=preprocessed_datadir)
+read_most_recent("chromHMM15_obs.grl", readdir = preprocessed_datadir)
+read_most_recent("chromHMM25_imp.grl", readdir = preprocessed_datadir)
+
+
+```
+
+
+
+# Input Data exploration
+
+```{r DILI-exploration}
+#Nicoletti
+table(topALL$chr, useNA = "always")
+table(topAC$chr, useNA = "always")
+table(topHC$chr, useNA = "always")
+table(topMC$chr, useNA = "always")
+table(topCH$chr, useNA = "always")
+
+#   => Enrichment over chromosomes: clearly more chr6 (HLA) in AC and MC
+
+venn(list( AC = topAC$SNP, all.pheno = topALL$SNP, CH = topCH$SNP, HC = topHC$SNP, MC = topMC$SNP))
+venn(list( AC = topAC$SNP, CH = topCH$SNP, HC = topHC$SNP, MC = topMC$SNP))
+
+topALL %>% inner_join(topAC, by="SNP") %>% inner_join(topHC,by="SNP") %>% inner_join(topMC,by="SNP") %>% inner_join(topCH,by="SNP")
+
+
+#HLA coordinates from https://www.ncbi.nlm.nih.gov/grc/human/regions/MHC?asm=GRCh37
+HLA.SNPs = all.DILI.SNP.df$SNP[all.DILI.SNP.df$chr==6 & all.DILI.SNP.df$bp > 28477797 & all.DILI.SNP.df$bp < 33448354]
+
+all.DILI.SNP.df %>% 
+  count(dataset,chr) %>%
+  ggplot(aes(x=chr,y=n))+
+  geom_bar(stat="identity")+
+  facet_wrap(~dataset)
+
+all.DILI.SNP.df %>% 
+  dplyr::filter(chr!=6)%>%
+  ggman(snp = "SNP", bp="bp", chrom = "chr", pvalue = "p-value", relative.positions = TRUE)+
+  facet_grid(dataset~.)
+
+mh <- all.DILI.SNP.df %>% 
+  # dplyr::filter(chr!=6)%>%
+  ggman(snp = "SNP", bp="bp", chrom = "chr", pvalue = "p-value", relative.positions = FALSE)
+ggmanHighlight(mh, highlight= HLA.SNPs)+
+  facet_grid(dataset~.)
+
+# plot(ecdf(log10(all.DILI.SNP.df$`p-value`)))  -> already contained in SNP rank per dataset
+
+```
+
+
+# Nicoletti et al 2017
+
+
+```{r Nicoletti-paper-rs-TO-chrpos-VIA-BM}
+#Nicoletti paper rs --> BiomaRt --> chr:pos  X  Nicoletti.newhits
+source("get_BM_anno.R")
+source("search_GWAS_loci.r")
+source("lookup_rs.R")
+source("simplify_associated_genes.R")
+
+Nicoletti.paper.BManno <- merge(
+  Nicoletti.paper,
+  get_BM_anno(Nicoletti.paper$RefSNP, ens37 = ensSNP.GRCh37.p13, ens38 = ensSNP.GRCh38.p12),
+  by.y = "refsnp_id.GRCh38", by.x = "RefSNP")
+
+# debug(lookup_rs)
+Nicoletti.lookup.df <- lookup_rs(rs.list = Nicoletti.paper$RefSNP, linktable = Nicoletti.paper.BManno)
+
+View(merge(Nicoletti.lookup.df, Nicoletti.paper.BManno, by.x = "SNP", by.y = "dbSNP", all.x = TRUE))
+
+#cast in dataframe for ppt
+Nicoletti.lookup.df.m <- melt(Nicoletti.lookup.df, measure.vars = c("match.rank", "match.offset"))
+dcast(Nicoletti.lookup.df.m, SNP+dataset ~ variable + assembly, value.var = "value")
+
+
+#analyse
+group_by(Nicoletti.lookup.df, assembly) %>%
+  summarise(
+    count = n(),
+    median = median(match.offset, na.rm = TRUE),
+    IQR = IQR(match.offset, na.rm = TRUE)
+  )
+
+ggplot(Nicoletti.lookup.df, aes(x=assembly,y=match.offset))+geom_boxplot()
+
+```
+
+
+# Mapping QC
+
+## top-ranking DILI SNPs
+
+```{r}
+
+nicoletti_BED_mapped_direct %>% group_by(chr, bp) %>% summarise(n.RefSNP.per.DILI.SNP = sum(!is.na(RefSNP))) %>% group_by(n.RefSNP.per.DILI.SNP) %>% summarise(n.group=n())%>%
+ggplot(aes(x=n.RefSNP.per.DILI.SNP, y=n.group))+
+  geom_histogram(stat = "identity")+
+  ylab("number of DILI SNPs")+
+  xlab("number of mapping RefSNPs")+
+  theme_bw()+
+  geom_text(aes(label=n.group), vjust=-0.3, size=3)+
+  ylim(c(0,40000))+
+  scale_x_discrete(limits = 0:7)
+ggsave(filename = get_versioned_fig_dir("multi_RefSNP", "png", figdir), width = 3, height=2.5)
+
+nicoletti_BED_mapped_direct %>% drop_na(RefSNP) %>% group_by(RefSNP) %>% summarise(n.DILI.SNP.per.RefSNP = n()) %>% arrange(RefSNP) %>% group_by(n.DILI.SNP.per.RefSNP) %>% summarise(n.group = n()) %>%
+ggplot(aes(x=n.DILI.SNP.per.RefSNP, y=n.group))+
+  geom_histogram(stat = "identity", width=0.6)+
+  ylab("number of RefSNPs")+
+  xlab("number of mapping DILI SNPs")+
+  theme_bw()+
+  geom_text(aes(label=n.group), vjust=-0.3, size=3)+
+  ylim(c(0,45000))+
+  scale_x_discrete(limits = 1:3)
+ggsave(filename = get_versioned_fig_dir("multi_DILI", "png", figdir), width = 3, height=2.5)
+
+nicoletti_BED_mapped_full %>% group_by(chr, bp, ref, codingoffset) %>% summarise(n.RefSNP.per.DILI.SNP = sum(!is.na(RefSNP))) %>% group_by(ref, codingoffset) %>% summarise(yield=mean(n.RefSNP.per.DILI.SNP>0)) %>%
+  ggplot(aes(x=ref,y=yield,fill=codingoffset)) + 
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_bw()+
+  xlab("Reference genome")+
+  ylab("Yield")+
+  scale_fill_discrete(name="offset")
+ggsave(get_versioned_fig_dir("yield_ref_offset","png",figdir), width = 6, height=2.5)
+
+```
+
+## ICP GWAS SNPs
+
+```{r}
+#from rosalind:
+yield_chr22 <- read_most_recent("p.ICP_GWAS_mapping_yield_chr22", rosalind_outdir)
+```
+
+
+# Overlap top-ranking DILI SNPs with ICP genes
+```{r}
+SNP.gene.overview.output <- get_SNPs_in_gene_overview(Dixon.ICP.genelist.GRCh37, ensSNP = ensSNP.GRCh37.p13)
+SNP.gene.matches <- SNP.gene.overview.output$SNP.gene.matches
+SNP.gene.lookup <- SNP.gene.overview.output$lookup.df
+SNP.consequences <- SNP.gene.overview.output$SNP.consequences
+```
+
+# LD 1KG 
+
+LD calculation pipeline (Rosalind):
+
+| Script                                    | Description                                                              |
+| ----------------------------------------- |--------------------------------------------------------------------------|
+|extract_1KG_VCFs.R 										    |extract Dixon ICP gene regions from VCFs on 1KG servers                   |
+|list_pop_samples.R										      |generate list of sample ID per 1KG (super)population                      |
+|extract_1KG_populations.sh	<population>		|extract VCF data for population                                           |     
+|plink_ICP_LD.sh	  <population>						|calculate LD for population, create one tar.gz containing LD in all genes |
+
+
+## 1KG population sensitivity analysis
+
+```{r}
+R2_comp <- dili_icp_rs_ld_plink %>% 
+  dplyr::select(population, gene, SNP_A, SNP_B, R2) %>% 
+  reshape2::dcast(gene+SNP_A+SNP_B~population) %>%
+  mutate(maxdiff_r2 = pmax(abs(CEU-EUR),abs(EUR-GBR),abs(GBR-CEU))) %>%
+  mutate_at(vars(CEU,EUR,GBR,maxdiff_r2), funs(round(.,2)))
+
+Dprime_comp <- dili_icp_rs_ld_plink %>% 
+  dplyr::select(population, gene, SNP_A, SNP_B, DP) %>% 
+  reshape2::dcast(gene+SNP_A+SNP_B~population) %>%
+  mutate(maxdiff_Dp = pmax(abs(CEU-EUR),abs(EUR-GBR),abs(GBR-CEU))) %>%
+  mutate_at(vars(CEU,EUR,GBR,maxdiff_Dp), funs(round(.,2)))
+
+
+topSNP.df <- SNP.gene.matches %>% group_by(dataset, gene)%>% summarise(topSNP=nth(RefSNP,n=1,order=`p-value`))
+
+
+R2_comp %>% 
+  merge(.,Dprime_comp, by = c("gene", "SNP_A", "SNP_B"), suffixes=c("_r2", "_Dp")) %>%
+  right_join(topSNP.df) %>%
+  dplyr::filter(SNP_A == topSNP | SNP_B == topSNP) %>% #View(.)
+  group_by(gene,dataset) %>%
+  summarise(overall_maxdiff_r2 = max(maxdiff_r2),
+            SNP_A_r2 = nth(SNP_A,n=1,order=maxdiff_r2),
+            SNP_B_r2 = nth(SNP_B,n=1,order=maxdiff_r2),
+            overall_maxdiff_dp = max(maxdiff_Dp),
+            SNP_A_Dp = nth(SNP_A,n=1,order=maxdiff_Dp),
+            SNP_B_Dp = nth(SNP_B,n=1,order=maxdiff_Dp))
+
+#why no information on ABCC2?
+unique(Dixon.ICP.genelist.GRCh37$gene) #ABCC2 included
+unique(dili_icp_rs_ld_plink$gene) #ABCC2 not included
+SNP.gene.matches[SNP.gene.matches$gene=="ABCC2","RefSNP"] #rs3740065
+in1KG("rs3740065") #TRUE  + also present in raw plink output read with fread
+Dixon.RefSNP.data.GRCh37 # => ABCC2 is only gene with only one SNP of interest (i.e. union of SNP.gene.matches and Dixon ICP SNPs)
+```
+
+## LD heatmaps
+
+```{r LD-among-ICPgene-DILI-rs}
+
+png(get_versioned_fig_dir("FADS2_heatmap","png",figdir))
+get_LD_heatmap("FADS2", dili_icp_rs_ld_plink, SNP.gene.matches)
+dev.off()
+
+png(get_versioned_fig_dir("ABCC4_heatmap","png",figdir))
+get_LD_heatmap("ABCC4", dili_icp_rs_ld_plink, SNP.gene.matches)
+dev.off()
+```
+
+
+# Enrichment analysis
+
+INRICH analysis pipeline (on Rosalind):
+
+1. inrich_analysis_setup_rosalind.R
+2. call_inrich.sh
+3. clean_inrich_logs.sh
+
+```{r parse-cleaned-inrich-logs}
+
+log_fp <- file.path(rosalind_outdir, "inrich_allruns_20181214_keep_cleaned.log")
+log_fp_ALL <- file.path(rosalind_outdir, "inrich_cleaned_ALL.log")
+
+inrich_results <- inrich_log_parser(log_fp = log_fp)
+inrich_results_ALL <- inrich_log_parser(log_fp = log_fp_ALL)
+inrich_results_df <- bind_rows(inrich_results, inrich_results_ALL)
+
+
+#write output
+inrich_results_df %>% 
+  dplyr::filter(population == "CEU" & rsq_10 == 5) %>% 
+  dplyr::select(`DILI subclass`=dili_pheno, 
+                `association intervals` = n_interval_genic_nonoverlap, 
+                `overlapping intervals`=n_overlaps,
+                p = overlap_p_cor) %>%
+  mutate(p=ifelse(.$`overlapping intervals`<2,NA,round(as.numeric(.$p),4))) %>%
+  write_excel_csv(path = "inrich_results_CEU_5.csv", na = "not assessed")
+
+```
+
+
+# Annotation of top-raning DILI SNPs in ICP genes 
+
+### EBI GWAS
+
+```{r}
+ebi_gwas <- fread( file.path(inputdir,"gwas-catalog-associations_ontology-annotated.tsv"),check.names = TRUE)
+
+core_gwas_anno <- ebi_gwas %>%
+  dplyr::filter(SNPS %in% SNP.gene.matches$RefSNP ) %>% 
+  merge(.,SNP.gene.matches,by.x="SNPS", by.y="RefSNP", all.x=TRUE, suffixes=c(".ebi", ".dili")) %>%
+  dplyr::select(SNPS,gene.dili=gene, PUBMEDID, FIRST.AUTHOR,STUDY, DISEASE.TRAIT, MAPPED_TRAIT, gene_EBI=MAPPED_GENE, PV_EBI=P.VALUE, dataset.DILI=dataset, PV.DILI=`p-value`, rank.DILI=rank)
+```
+
+### GTEX
+
+```{r}
+#read
+GTEX_ICP_gene_eQTLs <- list()
+for (gene in Dixon.ICP.genelist.GRCh37$gene){
+  GTEX_ICP_gene_eQTLs[[gene]] <- fread(file.path(inputdir, "GTEX",paste0("GTEx Portal_", gene, ".csv")))
+}
+
+#process
+GTEX_ICP_gene_eQTLs_df <- bind_rows(GTEX_ICP_gene_eQTLs, .id="gene")
+GTEX_ICP_gene_eQTLs_df <- GTEX_ICP_gene_eQTLs_df %>% dplyr::rename("RefSNP" = "SNP Id") %>% mutate(intragenic = RefSNP %in% RefSNP.gene.matches$refsnp_id) 
+```
+
+### PLINK LD
+
+
+
+```{r}
+dili_icp_rs_ld_plink <- list()
+for (population in c("EUR", "CEU", "GBR")){
+  dili_icp_rs_ld_plink[[population]] <- list()
+  #debug
+  # pop <- "CEU"
+  for (genename in Dixon.ICP.genelist.GRCh37$gene){
+    print(c(population, genename))
+    fp <- sprintf("../data/1KG_LD/%s_LD/%s_%s.ld.gz",population,genename,population)
+    ld <- fread(fp) %>% dplyr::select(SNP_A, SNP_B, R2, DP, MAF_A, MAF_B)
+    SNPs.of.interest <- unique(c(SNP.gene.matches$RefSNP, Dixon.RefSNP.data.GRCh37$RefSNP))
+    dili_icp_rs_ld_plink[[population]][[genename]] <- ld %>%
+      dplyr::filter(SNP_A %in% SNPs.of.interest & SNP_B %in% SNPs.of.interest) %>%
+      bind_rows(dplyr::select(.,SNP_A=SNP_B,SNP_B=SNP_A, MAF_A=MAF_B,MAF_B=MAF_A, R2, DP))
+  }
+  dili_icp_rs_ld_plink[[population]] <- bind_rows(dili_icp_rs_ld_plink[[population]], .id="gene")
+}
+dili_icp_rs_ld_plink <- bind_rows(dili_icp_rs_ld_plink, .id="population")
+```
+
+
+
+# GTEX SNPs
+
+```{r}
+#No top-ranking DILI SNPs outside of ICP-associated genes were found to be eQTLs for ICP-associated genes
+mean(GTEX_ICP_gene_eQTLs_df$intragenic)
+nicoletti_BED_mapped_direct %>% 
+  inner_join(GTEX_ICP_gene_eQTLs_df) %>% #DILI SNPs which are eQTLs for ICP genes
+  count(intragenic)
+
+#create overview
+GTEX_ICP_gene_eQTLs_df %>%
+  inner_join(SNP.gene.matches)%>%
+  group_by(gene,RefSNP,dataset,chr,bp,`p-value`,rank)%>%
+  summarise(Tissues = paste0(Tissue,collapse = "; "), eQTL_p_min = min(`P-Value`))%>%
+  arrange(bp) %>%
+  dplyr::rename(`DILI type` = "dataset", position = "bp", "DILI p" = "p-value", "DILI rank" = "rank", "eQTL p" = eQTL_p_min, Tissues= "Tissues") %>%
+  write_excel_csv(path="GTEX_suppl.csv")
+```
+
+# EBI GWAS SNPs
+
+```{r}
+core_gwas_anno %>%
+    dplyr::rename("RefSNP"="SNPS")%>%
+    inner_join(SNP.gene.matches)%>%
+    dplyr::select(gene = gene.dili, RefSNP = RefSNP, `DILI type` = dataset.DILI, chr, 
+                  position=bp, `DILI p` = PV.DILI, `DILI rank`=rank.DILI, `EBI p`=PV_EBI, MAPPED_TRAIT, FIRST.AUTHOR) %>%
+    arrange(gene,position)%>%
+    write_excel_csv("GWAS_suppl.csv")
+```
+
+# Gene tracks
+
+```{r plot-genetracks}
+# http://bioconductor.org/packages/release/bioc/vignettes/ggbio/inst/doc/ggbio.pdf
+# http://www.sthda.com/english/wiki/ggbio-visualize-genomic-data
+
+
+#### ggbio organismDB approach ####
+# library(Homo.sapiens)
+
+# data(genesymbol, package = "biovizBase")
+# ABCC4.r <- range(genesymbol["ABCC4"])
+# ggbio::autoplot(Homo.sapiens, which = ABCC4.r)
+# ggbio::autoplot(Homo.sapiens, which = ABCC4.r, stat="reduce")
+# ggbio::autoplot(Homo.sapiens, which = ABCC4.r, columns = c("SYMBOL","TXNAME"), names.expr = "TXNAME")
+# ggbio::autoplot(Homo.sapiens, which = ABCC4.r, columns = c("TXNAME"), names.expr = "TXNAME",  gap.geom = "chevron")
+
+#### ggbio ensdb approach ####
+
+#explore    #https://github.com/jotsetung/ensembldb/blob/master/vignettes/ensembldb.org
+# list_methods(class(EnsDb.Hsapiens.v75))
+# supportedFilters(EnsDb.Hsapiens.v75)
+
+#see whether EnsDb.Hsapiens.v75 ABCC4 gene range matches Biomart results   => SUCCESS!
+# range(transcripts(EnsDb.Hsapiens.v75, filter = ~ symbol == "ABCC4"))
+# Dixon.ICP.genelist.GRCh37 %>% dplyr::filter(gene == "ABCC4")
+
+# library(TxDb.Hsapiens.UCSC.hg19.knownGene)
+# txdb <- TxDb.Hsapiens.UCSC.hg19.knownGene
+# 
+# transcripts(txdb,filter=list(gene_id=10257))
+# select(txdb, keytype= "GENEID", keys="uc003uix.1", columns = "GENEID")
+# autoplot()
+
+get_ICP_gene_overview <- function(ICP_GWAS_merged_DT,genename, RefSNP.gene.matches, SNP.gene.matches,population, track.heights = c(7,1.5,1,3),
+                                  epi_signal, chromHMM.grl, GTEX, x_lim, n_space_padding, core_gwas_anno, sizerange){
+  library(ggbio)
+  library(ggrepel)
+  library(biomaRt)
+  library(EnsDb.Hsapiens.v75)
+  library(reshape2)
+  #### get all genename RefSNPs ####
+  gene.start <- start(range(transcripts(EnsDb.Hsapiens.v75, filter = ~ symbol == genename)))
+  gene.end <- end(range(transcripts(EnsDb.Hsapiens.v75, filter = ~ symbol == genename)))
+  gene.width <- width(range(transcripts(EnsDb.Hsapiens.v75, filter = ~ symbol == genename)))
+  gene.chr <- unique(levels(seqnames(transcripts(EnsDb.Hsapiens.v75, filter = ~ symbol == genename))))
+  density_flanks <- round(gene.width*0.5)
+
+  # browser()
+  
+  #filter LD data
+  fp <- sprintf("../data/1KG_LD/%s_LD/%s_%s.ld.gz",population,genename,population)
+  ld <- fread(fp) %>% dplyr::select(SNP_A, SNP_B, R2, DP, MAF_A, MAF_B)
+  DILI.SNPs.of.interest <- SNP.gene.matches %>% dplyr::filter(gene==genename) %>% .$RefSNP %>% unique(.)
+  ICP.SNPs.of.interest <- unique(ICP_GWAS_merged_DT[chr==gene.chr & bp > gene.start & bp < gene.end, RefSNP])
+  
+  #all vs all ld, incl self (r2=dp=1)
+  dili_icp_rs_ld <- ld %>%
+    dplyr::filter((SNP_A %in% ICP.SNPs.of.interest & SNP_B %in% DILI.SNPs.of.interest) |
+                    (SNP_A %in% DILI.SNPs.of.interest & SNP_B %in% ICP.SNPs.of.interest) |
+                    (SNP_A %in% DILI.SNPs.of.interest & SNP_B %in% DILI.SNPs.of.interest)) %>%
+    bind_rows(dplyr::select(.,SNP_A=SNP_B,SNP_B=SNP_A, MAF_A=MAF_B,MAF_B=MAF_A, R2, DP)) %>%   #make symmetrical (data duplication)
+    bind_rows(dplyr::select(.,SNP_A=SNP_A, MAF_A=MAF_A) %>%          #add explicit self
+                mutate(SNP_B=SNP_A, MAF_B=MAF_A, R2=1, DP=1) %>%
+                distinct()) %>% distinct()
+
+  
+    # ## sanity check for ABCC4
+    # #most DILI.SNPs are also included in the ICP GWAS
+    # intersect(DILI.SNPs.of.interest, ICP.SNPs.of.interest) #32
+    # setdiff(DILI.SNPs.of.interest, ICP.SNPs.of.interest) #3
+    # 
+    # #LD information is missing on 71/755 ICP SNPs and 2/35 DILI SNPs
+    # length(unique(DILI.SNPs.of.interest))
+    # length(unique(ICP.SNPs.of.interest))
+    # dili_icp_rs_ld %>% summarise(n_ICP_SNP =n_distinct(SNP_A[SNP_A %in% ICP.SNPs.of.interest]),
+    #                              n_DILI_SNP =n_distinct(SNP_A[SNP_A %in% DILI.SNPs.of.interest]))
+    # 
+    # #LD information is complete:
+    #   # STRICTLY ICP SNPs have info on LD with 34 SNPs (33 DILI SNPs + themselves)
+    #   # top DILI SNPs have info on LD with 687 SNPs (684 ICPs SNPs + 3 strict DILI SNPs, incl self)
+    # dili_icp_rs_ld %>% group_by(SNP_A) %>% summarise(n_ICP_SNP =n_distinct(SNP_B)) %>% View(.)
+    # 
+
+   #### RefSNP density track ####
+  
+    # RefSNP.density.track <- ggplot(gene.SNPs, aes(x=chrom_start))+geom_density(adjust=0.1)+ylab("RefSNP density")
+  RefSNP.hist.track <- ggplot(dplyr::filter(RefSNP.gene.matches,gene==genename), aes(x=chrom_start))+geom_histogram(binwidth=100)+
+    ylab("rs/100 bp")+
+    theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.y = element_text(angle=0, vjust=0.5,size=7))+
+    ggplot2::coord_cartesian(xlim=c(start(x_lim), end(x_lim)))
+    # coord_cartesian(xlim=xlim)
+  
+  
+  #### gene.model ####
+  # browser()
+  # gene.model <- ggbio::autoplot(EnsDb.Hsapiens.v75, ~ symbol == genename, names.expr = c("tx_name"), gap.geom = "chevron", stat="reduce")
+  # gene.model <- ggbio::autoplot(EnsDb.Hsapiens.v75, ~ symbol == genename, names.expr = c("tx_name"), stat="reduce")+
+  gene.model <- ggbio::autoplot(EnsDb.Hsapiens.v75, ~ symbol == genename, names.expr = c("tx_name"),label=FALSE, gap.geom = "chevron")+
+    ylab("transcript model")+
+    theme(axis.title.y = element_text(angle=0, vjust=0.5, size=7))+
+    ggplot2::coord_cartesian(xlim=c(start(x_lim), end(x_lim)))
+    # coord_cartesian(xlim=xlim)
+
+  
+  # #### ICP SNP track ####   => merged in DILI data track
+  # ICP.SNP.track <- Dixon.RefSNP.data.GRCh37 %>% 
+  # dplyr::filter(gene==genename) %>% 
+  # ggplot(aes(x=chrom_start,y=1))+
+  # theme_classic()+
+  # geom_point(size=)+
+  # geom_hline(aes(yintercept=1)) +
+  # ylab("ICP SNPs")+
+  # xlab("")+
+  # theme(axis.text.y=element_blank(),
+  #       axis.ticks.y=element_blank(),
+  #       axis.title.y = element_text(angle=0, vjust=0.5))
+  
+  
+  # browser()
+  #### PV track ####
+  
+  topSNP.df <- SNP.gene.matches %>% dplyr::filter(gene==genename) %>% group_by(dataset)%>% summarise(topSNP=nth(RefSNP,n=1,order=`p-value`))
+
+
+  #### chromHMM track ####
+  SNP.gr <- SNP.gene.matches.grl[[genename]]
+  chromHMM.gr <- chromHMM.grl[[genename]]
+  # left join granges metacols https://stackoverflow.com/questions/51713122/granges-left-join
+  # hits <- findOverlaps(SNP.gr,chromHMM25.gr)
+  # mcols(SNP.gr)[queryHits(hits),c("E066_c","E118_c")] <- mcols(chromHMM25.gr)[subjectHits(hits),c("E066_c","E118_c")] 
+  # SNPs_chromHMM25_anno <- as_data_frame(SNP.gr) %>% mutate(RefSNP = names(SNP.gr))
+  
+  chromHMM.track <- chromHMM.gr %>% as_data_frame() %>% 
+    reshape2::melt(., measure.vars = c("E066_c", "E118_c"), variable.name = "sample", value.name = "state") %>% 
+    drop_na() %>%
+    mutate(sample=recode(sample,"E066_c" = "Primary liver", "E118_c"= "HEPG2"),
+           state = gsub(state,pattern="_",replacement = " ")) %>%
+    
+    ggplot(aes(fill=state))+
+    ggplot2::geom_rect(aes(xmin=start,xmax=end,ymin=0,ymax=1))+
+    facet_grid(sample~.)+
+    theme_bw()+
+    scale_fill_discrete(name="chromHMM")+
+    theme(axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.title.y = element_text(angle=0, vjust=0.5,size=7),
+          legend.text=element_text(size=7), 
+          legend.title = element_text(size=7), 
+          legend.key.size = unit(0.2,"cm"),
+          strip.text.y = element_text(angle=0,size=7),
+          legend.direction = "vertical",
+          legend.background = element_rect(color = "black", fill = "grey90", linetype = "solid"),
+          legend.position = c(-0.09,0.5),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor.y = element_blank())+
+    ggplot2::coord_cartesian(xlim=c(start(x_lim), end(x_lim)))+
+    ylab("")
+  
+  
+  #### ICP and DILI track ####
+  
+  #IDENTICAL TO Ensembl LD calc option 2 after filtering for r_sq >0.2
+  # ld %>% dplyr::select(SNP_A, SNP_B, R2) %>% dplyr::filter(SNP_A %in% SNP.gene.matches$RefSNP & SNP_B %in% SNP.gene.matches$RefSNP) %>%
+  #   dplyr::arrange(SNP_A,SNP_B)
+  # icp_gene_dili_rs_ld %>% dplyr::select(input_RefSNP, matched_RefSNP, r_sq) %>% dplyr::filter(r_sq > 0.2) %>% dplyr::arrange(input_RefSNP, matched_RefSNP) %>%
+  #   dplyr::filter(input_RefSNP != matched_RefSNP)
+  
+  get_fifth <- function(v){
+    v[order(v)][5]
+  }
+
+  #maximal LD with DILI SNPs for each ICP SNP
+  max_LD_w_DILI_SNPs <- dili_icp_rs_ld %>% group_by(SNP_A) %>% 
+    dplyr::filter(SNP_B %in% DILI.SNPs.of.interest) %>% 
+    summarise(LD_SNP = dplyr::last(SNP_B, order_by = R2)) %>%
+    dplyr::rename("input_SNP" = "SNP_A") %>%
+    merge(.,dili_icp_rs_ld, by.x=c("input_SNP","LD_SNP"), by.y=c("SNP_A","SNP_B"))
+  
+  ICP_GWAS_gene <- ICP_GWAS_merged_DT[chr==gene.chr & bp > gene.start & bp < gene.end]
+  ICP.to.add <- as.data.frame(matrix(NA,
+                                     nrow = nrow(ICP_GWAS_gene),
+                                     ncol=ncol(SNP.gene.matches)))
+  names(ICP.to.add) <- names(SNP.gene.matches)
+  ICP.to.add <- ICP.to.add %>%
+    mutate(RefSNP = ICP_GWAS_gene[,RefSNP],
+           bp = ICP_GWAS_gene[,bp],
+           gene=genename,
+           chr=paste0("chr",ICP_GWAS_gene[,chr]),
+           dataset="ICP",
+           assembly="GRCh37",
+           `p-value`= ICP_GWAS_gene[,P]) %>%
+    merge(., max_LD_w_DILI_SNPs[,c("input_SNP", "LD_SNP")], by.x=c("RefSNP"), by.y=c("input_SNP"), all.x=TRUE)
+  
+  #ANNOTATE DILI+ICP data
+  GWAS_or_eQTL <- function(rs, eQTL_SNPs, GWAS_SNPs){
+    ifelse(rs %in% eQTL_SNPs,
+           ifelse(rs %in% GWAS_SNPs, "GWAS+eQTL", "eQTL"),
+           ifelse(rs %in% GWAS_SNPs, "GWAS", "none"))
+  }
+  
+
+ 
+  
+  DILI.data <- SNP.gene.matches[SNP.gene.matches$gene==genename,] %>% 
+    left_join(topSNP.df, by=c("dataset")) %>% 
+    dplyr::rename("LD_SNP" = "topSNP") %>%
+    # left_join(topSNP.df, by=c("dataset")) -> tmp
+    bind_rows(ICP.to.add) %>%
+    # dplyr::mutate(lit=GWAS_or_eQTL(RefSNP, eQTL_SNPs = GTEX$RefSNP, GWAS_SNPs = ebi_gwas$SNPS),
+                  # p_based_label = ifelse(`p-value` < get_fifth(`p-value`),RefSNP,"")) %>% 
+    dplyr::mutate(lit=GWAS_or_eQTL(RefSNP, eQTL_SNPs = GTEX$RefSNP, GWAS_SNPs = ebi_gwas$SNPS)) %>% 
+    merge(.,dili_icp_rs_ld, by.x=c("RefSNP","LD_SNP"),by.y=c("SNP_A","SNP_B"),all.x=TRUE) %>%
+    dplyr::mutate(MAF = MAF_A) %>%
+    dplyr::select(-c(MAF_A,MAF_B)) 
+    # left_join(SNPs_chromHMM25_anno)
+  
+  
+  # DILI.data <- SNP.gene.matches[SNP.gene.matches$gene==genename,] %>% 
+  #   
+  #   dplyr::mutate(`In EBI GWAS`= RefSNP %in% core_gwas_anno$SNPS,
+  #          p_based_label = ifelse(`p-value` < get_fifth(`p-value`),RefSNP,"")) %>% 
+  #   left_join(topSNP.df) %>%
+  #   merge(.,dili_rs_ld, by.x=c("RefSNP","topSNP"),by.y=c("SNP_A","SNP_B"),all.x=TRUE) %>%
+  #   dplyr::mutate(MAF = ifelse(RefSNP==topSNP,unique(dili_rs_ld$MAF_A[dili_rs_ld$SNP_A==unique(topSNP)]),MAF_A)) %>%
+  #   dplyr::select(-c(MAF_A,MAF_B))
+  # 
+  # # case_na <- function(x,d){
+  # #   ifelse(is.na(x),d,x)
+  # # }
+  # 
+
+  DILI.data.track <- DILI.data  %>%
+    ggplot(aes(x=bp, y=-log10(`p-value`), shape=factor(lit), size=MAF,2))+
+    # ggplot(aes(x=bp, y=-log10(`p-value`), shape=`In EBI GWAS`, size=MAF))+
+    geom_point(aes(color=R2))+
+    theme_bw()+
+    theme(legend.text=element_text(size=5), 
+          legend.title = element_text(size=7), 
+          legend.key.size = unit(0.35,"cm"), 
+          legend.position = c(-0.09,0.5),
+          panel.grid.minor.y = element_blank())+
+    guides(size=guide_legend(override.aes = list(color="black", shape = 16)), shape=guide_legend(override.aes = list(color="black")))+
+    # theme(legend.text=element_text(size=7), legend.title = element_text(size=10), legend.key.size = unit(0.5,"cm"),legend.position = "left")+
+    # guide_legend(label.theme = element_text(size = 2))+
+    geom_point(color = "red", data = DILI.data %>% dplyr::filter(RefSNP==LD_SNP & dataset != "ICP"))+    #will work for multiple facets
+    geom_point(color = "#6c6e70", size=mean(sizerange), data = DILI.data %>% dplyr::filter(is.na(MAF)))+    #will work for multiple facets
+    facet_grid(factor(dataset, levels=c("all", "AC", "CH", "MC", "HC", "ICP"))~.)+
+    ylim(c(0,5))+
+    # geom_text_repel(label= DILI.data$p_based_label,size=2, nudge_x = -4000,color="#8b8c8e")+
+    # geom_text_repel(label= DILI.data$p_based_label[DILI.data$RefSNP==DILI.data$topSNP],size=2, nudge_x = -4000,color="red")+
+    scale_color_gradient(low="#42f4f4",high="#050149",limits=c(0,1), name= "r-square")+
+    scale_shape_manual(name="Cross-ref.", limits = c("none", "eQTL", "GWAS", "GWAS+eQTL"), values = c(1,3,17,15))+
+    scale_size_continuous(range=sizerange, limits=c(0,max(0.5, DILI.data$MAF[DILI.data$gene==genename])),name="MAF")+
+    ylab("-log10(PV)")+
+    ggplot2::coord_cartesian(xlim=c(start(x_lim), end(x_lim)))
+  
+ # x_lim <-Dixon.ICP.gr[Dixon.ICP.gr$gene_incl_2kb_prom=="ABCC4"]*4
+  
+  #marks from 12-mark model; https://personal.broadinstitute.org/meuleman/reg2map/ and Ernst2015 fig6c
+  mark12 <- c("H3K9me3|H3K36me3|H4K20me1|H3K79me2|H3K4me1|H3K27ac|DNase|H3K9ac|H3K4me3|H3K4me2|H2A.Z|H3K27me3")
+
+  epigenetics.track <- epi_signal[[genename]] %>% 
+    melt(id.vars = "mids", variable.name="mark", value.name="signal") %>%
+    dplyr::filter(grepl(mark,pattern = "E066_imp")) %>%
+    dplyr::filter(str_detect(mark, mark12)) %>% 
+    tidyr::separate(mark, sep="_", into=c("mark_clean","sample","obs_imp"))%>%
+    dplyr::mutate(mark_padded = paste0(strrep(" ",n_space_padding),mark_clean))%>%
+    group_by(mark_padded) %>%
+    dplyr::mutate(scaled_signal = gviz_rescale(signal)) %>%
+    replace_na(list(scaled_signal=0)) %>%
+    
+    ggplot(aes(x=mids,y=factor(mark_padded),fill=scaled_signal))+ 
+    theme_classic() +
+    geom_tile()+
+    scale_fill_gradientn(colors=c("#F7FBFF", "#DEEBF7", "#C6DBEF", "#9ECAE1", "#6BAED6", "#4292C6", "#2171B5", "#08519C", "#08306B"),guide=FALSE)+
+    theme(axis.text=element_text(size=7))+
+    ylab("") +
+    xlab("")+
+    ggplot2::coord_cartesian(xlim=c(start(x_lim), end(x_lim)))
+
+  
+  
+  #### create plot ####
+  # tracks(RefSNP.hist.track, DILI.data.track,chromHMM25.track, gene.model,epigenetics.track, heights = c(0.5,5,1,1,3))
+  # tracks(RefSNP.hist.track, DILI.data.track,chromHMM.track, gene.model,epigenetics.track, heights = track.heights, xlab = sprintf("bp (chromosome %s)", Dixon.ICP.genelist.GRCh37$chromosome_name[Dixon.ICP.genelist.GRCh37$gene==genename]))
+  tracks(DILI.data.track,chromHMM.track, gene.model,epigenetics.track, heights = track.heights, xlab = sprintf("bp (chromosome %s)", Dixon.ICP.genelist.GRCh37$chromosome_name[Dixon.ICP.genelist.GRCh37$gene==genename]))
+  # xlim=c(gene.start-0.2*density_flanks,gene.end+0.2*density_flanks)
+  # list(RefSNP.hist.track=RefSNP.hist.track, DILI.data.track=DILI.data.track, gene.model=gene.model, epigenetics.track=epigenetics.track)
+}
+
+
+
+
+
+
+# read_most_recent("sdf_list",RDSdir)
+# for overlapping with chromHMM25
+SNP.gene.matches.grl <- makeGRangesListFromDataFrame(df=SNP.gene.matches, split.field="gene", names.field="RefSNP",
+                                                       ignore.strand=TRUE,seqnames.field="chr", start.field="bp", end.field="bp")
+
+zoomranges <- data.frame(
+  zoomname= c("ABCC4_all", "ABCC4_AC", "ABCC4_AC1", "ABCC4_AC2", "FADS2_CH1", "FADS2_CH2","FADS2_CH3", "FADS2_CH", "ARHGEF28_AC"),
+  chr = c(13,13,13,13,11,11,11,11,5),
+  start = c(95790000, 95916000, 95915500, 95935000, 61578000, 61595000,61605000, 61578000, 73060000),
+  end =   c(95810000, 95939500, 95924000, 95940000, 61587000, 61605000,61610000, 61610000, 73090000),
+  strand = "*")
+zoomranges.grl <-makeGRangesListFromDataFrame(df=zoomranges, split.field="zoomname", names.field="zoomname",
+                                              ignore.strand=TRUE,seqnames.field="chr", start.field="start", end.field="end")
+
+commonpars <- list(RefSNP.gene.matches=RefSNP.gene.matches, 
+                   SNP.gene.matches=SNP.gene.matches,
+                   epi_signal=sdf_list_50,
+                   ICP_GWAS_merged_DT = ICP_GWAS_merged_DT,
+                   n_space_padding = 15, 
+                   GTEX = GTEX_ICP_gene_eQTLs_df,
+                   pop="CEU",
+                   core_gwas_anno=core_gwas_anno,
+                   sizerange=c(1,3))
+
+ABCC4_tracks_global_imp <- do.call(get_ICP_gene_overview, c(genename = "ABCC4", 
+                                                            x_lim = Dixon.ICP.gr[Dixon.ICP.gr$gene_incl_2kb_prom=="ABCC4"],
+                                                            list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                            list(track.heights = c(7,2,1,3)),
+                                                            commonpars))
+ABCC4_tracks_global_obs <- do.call(get_ICP_gene_overview, c(genename = "ABCC4", 
+                                                            x_lim = Dixon.ICP.gr[Dixon.ICP.gr$gene_incl_2kb_prom=="ABCC4"],
+                                                            list(chromHMM.grl = chromHMM15_obs.grl),
+                                                            commonpars))
+
+ABCC4.tracks_all <- do.call(get_ICP_gene_overview, c("ABCC4", 
+                                                     x_lim = zoomranges.grl$ABCC4_all, 
+                                                     list(chromHMM.grl = chromHMM25_imp.grl),
+                                                     commonpars))
+
+ABCC4.tracks_AC1 <- do.call(get_ICP_gene_overview, c("ABCC4", 
+                                                     x_lim = zoomranges.grl$ABCC4_AC1,
+                                                     list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                     commonpars))
+
+ABCC4.tracks_AC2 <- do.call(get_ICP_gene_overview, c("ABCC4",
+                                                     x_lim = zoomranges.grl$ABCC4_AC2, 
+                                                     list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                     commonpars))
+
+ABCC4.tracks_AC <- do.call(get_ICP_gene_overview, c("ABCC4", 
+                                                    x_lim = zoomranges.grl$ABCC4_AC,
+                                                    list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                    commonpars))
+
+
+FADS2_tracks_global_imp <- do.call(get_ICP_gene_overview, c("FADS2", 
+                                                            x_lim = Dixon.ICP.gr[Dixon.ICP.gr$gene_incl_2kb_prom=="FADS2"], 
+                                                            list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                            commonpars))
+
+FADS2_tracks_global_obs <- do.call(get_ICP_gene_overview, c("FADS2", 
+                                                            x_lim = Dixon.ICP.gr[Dixon.ICP.gr$gene_incl_2kb_prom=="FADS2"], 
+                                                            list(chromHMM.grl =  chromHMM15_obs.grl), 
+                                                            commonpars))
+
+FADS2_tracks_CH1 <- do.call(get_ICP_gene_overview, c("FADS2", 
+                                                     x_lim = zoomranges.grl$FADS2_CH1, 
+                                                     list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                     commonpars))
+
+FADS2_tracks_CH2 <- do.call(get_ICP_gene_overview, c("FADS2", 
+                                                     x_lim = zoomranges.grl$FADS2_CH2,
+                                                     list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                     commonpars))
+
+FADS2_tracks_CH3 <- do.call(get_ICP_gene_overview, c("FADS2", 
+                                                     x_lim = zoomranges.grl$FADS2_CH3,
+                                                     list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                     commonpars))
+
+FADS2_tracks_CH <- do.call(get_ICP_gene_overview, c("FADS2", 
+                                                    x_lim = zoomranges.grl$FADS2_CH, 
+                                                    list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                    commonpars))
+
+
+ABCC2_tracks_global <- do.call(get_ICP_gene_overview, c("ABCC2", 
+                                                        x_lim = Dixon.ICP.gr[Dixon.ICP.gr$gene_incl_2kb_prom=="ABCC2"], 
+                                                        list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                        commonpars))
+
+ARHGEF28_tracks_global <- do.call(get_ICP_gene_overview, c("ARHGEF28", 
+                                                           x_lim = Dixon.ICP.gr[Dixon.ICP.gr$gene_incl_2kb_prom=="ARHGEF28"], 
+                                                           list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                           list(track.heights = c(0.5,7,2,1,3)),
+                                                           commonpars))
+
+CYP7A1_tracks_global <- do.call(get_ICP_gene_overview, c("CYP7A1", 
+                                                         x_lim = Dixon.ICP.gr[Dixon.ICP.gr$gene_incl_2kb_prom=="CYP7A1"], 
+                                                         list(chromHMM.grl = chromHMM25_imp.grl), 
+                                                         commonpars))
+
+# ggsave(plot = FADS2.tracks, filename = get_versioned_png_dir("FADS2", figdir))
+
+# ggsave("FADS2_DILI_epi.emf")
+ggsave(filename = get_versioned_fig_dir("ABCC4_tracks_global_imp","png",figdir),plot=ABCC4_tracks_global_imp, width = 25, height = 18, units="cm")
+ggsave(filename = get_versioned_fig_dir("ABCC4_tracks_global_obs","png",figdir),plot=ABCC4_tracks_global_obs, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("ABCC4_tracks_all","png",figdir),plot=ABCC4.tracks_all, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("ABCC4_tracks_AC1","png",figdir),plot=ABCC4.tracks_AC1, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("ABCC4_tracks_AC2","png",figdir),plot=ABCC4.tracks_AC2, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("ABCC4_tracks_AC","png",figdir),plot=ABCC4.tracks_AC, width = 25, height = 16, units="cm")
+
+ggsave(filename = get_versioned_fig_dir("FADS2_tracks_global_imp","png",figdir),plot=FADS2_tracks_global_imp, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("FADS2_tracks_global_obs","png",figdir),plot=FADS2_tracks_global_obs, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("FADS2_tracks_CH1","png",figdir),plot=FADS2_tracks_CH1, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("FADS2_tracks_CH2","png",figdir),plot=FADS2_tracks_CH2, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("FADS2_tracks_CH3","png",figdir),plot=FADS2_tracks_CH3, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("FADS2_tracks_CH","png",figdir),plot=FADS2_tracks_CH, width = 25, height = 16, units="cm")
+
+ggsave(filename = get_versioned_fig_dir("ABCC2_tracks_global","png",figdir),plot=ABCC2_tracks_global, width = 25, height = 16, units="cm")
+ggsave(filename = get_versioned_fig_dir("ARHGEF28_tracks_global","png",figdir),plot=ARHGEF28_tracks_global, width = 25, height = 17, units="cm")
+ggsave(filename = get_versioned_fig_dir("CYP7A1_tracks_global","png",figdir),plot=CYP7A1_tracks_global, width = 25, height = 16, units="cm")
+
+```
